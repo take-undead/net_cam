@@ -380,9 +380,17 @@ function buildGrid() {
     // タイルクリックで選択
     tile.addEventListener('click', () => selectCamera(cam.id));
 
-    // ストリームエラー時に停止
+    // ストリームエラー時に自動再接続（撮影中の一時切断から復帰）
     document.getElementById(`img-${cam.id}`).addEventListener('error', () => {
-      if (cameras[cam.id].streaming) stopStream(cam.id);
+      if (cameras[cam.id].streaming) {
+        setTimeout(() => {
+          if (cameras[cam.id].streaming) {
+            // キャッシュ回避のためタイムスタンプ付きで再接続
+            document.getElementById(`img-${cam.id}`).src =
+              `http://${cameras[cam.id].ip}:81/stream?t=${Date.now()}`;
+          }
+        }, 2000);
+      }
     });
   });
 }

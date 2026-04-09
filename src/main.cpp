@@ -204,7 +204,9 @@ void connectWiFi() {
 }
 
 // ============================================================
-// カメラを初期化する（OV2640 / SVGA / JPEG品質12）
+// カメラを初期化する（OV2640 / UXGA / JPEG品質12）
+// バッファはUXGA(1600×1200)サイズで確保し、起動後にSVGAへ下げる
+// こうすることで実行時のset_framesizeが安全に動作する
 // ============================================================
 void initCamera() {
     camera_config_t config;
@@ -228,15 +230,21 @@ void initCamera() {
     config.pin_reset    = RESET_GPIO_NUM;
     config.xclk_freq_hz = 20000000;
     config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size   = FRAMESIZE_SVGA;   // 800×600
-    config.jpeg_quality = 12;               // 0〜63（小さいほど高品質）
-    config.fb_count     = 2;
+    config.frame_size   = FRAMESIZE_UXGA;  // 1600×1200でバッファ確保
+    config.jpeg_quality = 10;              // 0〜63（小さいほど高品質）
+    config.fb_count     = 2;              // 2バッファでストリームと撮影が競合しない
 
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
         Serial.printf("[ERROR] カメラ初期化失敗: 0x%x\n", err);
         while (true) { delay(1000); }
     }
+
+    // ストリーム用にSVGA(800×600)へ下げる
+    // バッファはUXGA確保済みのため安全に切り替え可能
+    sensor_t *s = esp_camera_sensor_get();
+    s->set_framesize(s, FRAMESIZE_SVGA);
+
     Serial.println("[OK] カメラ初期化完了");
 }
 
@@ -425,6 +433,14 @@ static esp_err_t captureHandler(httpd_req_t *req) {
     // 年月フォルダを自動作成（/photo/YYYYMM/）
     String monthDir = ensureMonthDir();
 
+    // 撮影前: センサーを高解像度(UXGA 1600×1200)に切り替え
+    sensor_t *sensor = esp_camera_sensor_get();
+    sensor->set_framesize(sensor, FRAMESIZE_UXGA);
+    // センサーが新解像度に安定するまで待機（バッファをフラッシュ）
+    delay(200);
+    camera_fb_t *dummy = esp_camera_fb_get();
+    if (dummy) esp_camera_fb_return(dummy);
+
     camera_fb_t *fb = nullptr;
 
     // フラッシュON撮影フロー
@@ -434,12 +450,13 @@ static esp_err_t captureHandler(httpd_req_t *req) {
         fb = esp_camera_fb_get();            // 撮影
         digitalWrite(FLASH_GPIO_NUM, LOW);   // 即座に消灯（1秒以内厳守）
     } else {
-        // フラッシュOFF撮影フロー
         fb = esp_camera_fb_get();
     }
 
+    // 撮影後: ストリーム用解像度(SVGA 800×600)に戻す
+    sensor->set_framesize(sensor, FRAMESIZE_SVGA);
+
     if (!fb) {
-        // エラー時もフラッシュを確実に消灯（finally相当）
         digitalWrite(FLASH_GPIO_NUM, LOW);
         httpd_resp_send(req, "{\"status\":\"error\",\"message\":\"camera capture failed\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
