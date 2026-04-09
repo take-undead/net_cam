@@ -80,7 +80,11 @@ String cfgSSID     = DEF_SSID;
 String cfgPassword = DEF_PASSWORD;
 
 // HTTPサーバーハンドル
-httpd_handle_t camHttpd = NULL;
+// ストリームは専用サーバー(port 81)に分離する
+// 理由: httpd はシングルタスクのためストリームの while(true) が
+//       同一サーバーの他リクエスト処理をブロックするため
+httpd_handle_t streamHttpd = NULL;
+httpd_handle_t camHttpd    = NULL;
 
 // ============================================================
 // 文字列ユーティリティ：前後の空白を除去する
@@ -98,12 +102,36 @@ static String trimString(const String &s) {
 // 失敗した場合はデフォルト値のまま続行する
 // ============================================================
 void loadConfig() {
-    // SDカードを1-bitモードでマウント
-    delay(300);
-    if (!SD_MMC.begin("/sdcard", true)) {
+    // AI-Thinker ESP32-CAM: GPIO2（SD D0ライン）をプルアップしてから初期化
+    // フローティング状態のままだと0x107(ESP_ERR_TIMEOUT)で初期化失敗する
+    pinMode(2, INPUT_PULLUP);
+    delay(500);
+
+    // リトライ付きマウント（SD_MMC.end()でリセットしてから再試行）
+    bool mounted = false;
+    for (int attempt = 0; attempt < 3 && !mounted; attempt++) {
+        if (attempt > 0) {
+            SD_MMC.end();
+            delay(500);
+            Serial.printf("[INFO] SDカード再試行 %d/3\n", attempt + 1);
+        }
+        // 第2引数: true=1-bitモード(GPIO2のみ), false=4-bitモード(GPIO4がSDに使われフラッシュLED不可)
+        // 第4引数: SDMMC_FREQ_PROBING(400kHz) — デフォルト20MHzより低速で信号品質問題を回避
+        mounted = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_PROBING);
+    }
+
+    if (!mounted) {
         Serial.println("[WARN] SDカードマウント失敗 → デフォルト値で起動");
         return;
     }
+
+    // SDカード情報をシリアル出力
+    uint8_t cardType = SD_MMC.cardType();
+    const char* typeStr = (cardType == CARD_MMC)  ? "MMC"  :
+                          (cardType == CARD_SD)   ? "SD"   :
+                          (cardType == CARD_SDHC) ? "SDHC" : "UNKNOWN";
+    uint64_t cardMB = SD_MMC.cardSize() / (1024 * 1024);
+    Serial.printf("[SD] マウント成功 タイプ:%s 容量:%lluMB\n", typeStr, cardMB);
 
     File f = SD_MMC.open("/config.txt", FILE_READ);
     if (!f) {
@@ -213,26 +241,39 @@ void initCamera() {
 }
 
 // ============================================================
-// /photo/ ディレクトリのファイル一覧を降順ソートで返すヘルパー
+// /photo/YYYYMM/ サブフォルダを再帰的に走査してファイル一覧を降順で返す
+// 返す値は "YYYYMM/YYYYMMDD_HHmmss.jpg" 形式（サブフォルダ名込み）
 // ============================================================
 static std::vector<String> listPhotoFiles() {
     std::vector<String> files;
 
-    File dir = SD_MMC.open("/photo");
-    if (!dir || !dir.isDirectory()) return files;
+    File root = SD_MMC.open("/photo");
+    if (!root || !root.isDirectory()) return files;
 
-    File entry = dir.openNextFile();
-    while (entry) {
-        if (!entry.isDirectory()) {
-            String name = String(entry.name());
-            // パスが含まれる場合はファイル名のみ抽出
-            int slash = name.lastIndexOf('/');
-            if (slash >= 0) name = name.substring(slash + 1);
-            if (name.endsWith(".jpg") || name.endsWith(".JPG")) {
-                files.push_back(name);
+    // 年月フォルダを走査
+    File monthEntry = root.openNextFile();
+    while (monthEntry) {
+        if (monthEntry.isDirectory()) {
+            String monthName = String(monthEntry.name());
+            int slash = monthName.lastIndexOf('/');
+            if (slash >= 0) monthName = monthName.substring(slash + 1);
+
+            File photoEntry = monthEntry.openNextFile();
+            while (photoEntry) {
+                if (!photoEntry.isDirectory()) {
+                    String name = String(photoEntry.name());
+                    int s = name.lastIndexOf('/');
+                    if (s >= 0) name = name.substring(s + 1);
+                    if (name.endsWith(".jpg") || name.endsWith(".JPG")) {
+                        files.push_back(monthName + "/" + name);
+                    }
+                }
+                // openNextFile() はディレクトリオブジェクトに対して呼ぶ
+                // photoEntry.openNextFile() は誤り（ファイルに呼んでも進まない）
+                photoEntry = monthEntry.openNextFile();
             }
         }
-        entry = dir.openNextFile();
+        monthEntry = root.openNextFile();
     }
 
     // 降順ソート（新しいファイルが先頭）
@@ -244,17 +285,34 @@ static std::vector<String> listPhotoFiles() {
 }
 
 // ============================================================
+// 年月フォルダを作成して返す（/photo/YYYYMM/）
+// currentTimeが未設定の場合は /photo/unknown/ を使う
+// ============================================================
+static String ensureMonthDir() {
+    String dir;
+    if (currentTime.length() == 14) {
+        dir = "/photo/" + currentTime.substring(0, 6); // YYYYMM
+    } else {
+        dir = "/photo/unknown";
+    }
+    if (!SD_MMC.exists("/photo")) SD_MMC.mkdir("/photo");
+    if (!SD_MMC.exists(dir))     SD_MMC.mkdir(dir);
+    return dir;
+}
+
+// ============================================================
 // 重複しない連番ファイル名を生成する（photo_001.jpg 形式）
 // ============================================================
 static String generateSeqFileName() {
+    String dir = ensureMonthDir();
     for (int i = 1; i <= 9999; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "/photo/photo_%03d.jpg", i);
+        char buf[48];
+        snprintf(buf, sizeof(buf), "%s/photo_%03d.jpg", dir.c_str(), i);
         if (!SD_MMC.exists(buf)) {
             return String(buf);
         }
     }
-    return "/photo/photo_unknown.jpg";
+    return dir + "/photo_unknown.jpg";
 }
 
 // ============================================================
@@ -340,28 +398,32 @@ static esp_err_t setTimeHandler(httpd_req_t *req) {
 }
 
 // ============================================================
-// 静止画撮影・保存ハンドラ（GET /capture?flash=on|off）
-// フラッシュ使用有無を指定して撮影しSDカードに保存する
+// 静止画撮影・保存ハンドラ（GET /capture?flash=on|off&t=YYYYMMDDHHmmss）
+// t パラメータで時刻を同時受信することで /settime との2往復を1往復に削減する
 // ============================================================
 static esp_err_t captureHandler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET");
     httpd_resp_set_type(req, "application/json");
 
-    // flash パラメータを取得
-    char query[64] = {0};
+    char query[128] = {0};
     bool useFlash = false;
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        // flash パラメータ
         char flashParam[16] = {0};
         if (httpd_query_key_value(query, "flash", flashParam, sizeof(flashParam)) == ESP_OK) {
             useFlash = (strcmp(flashParam, "on") == 0);
         }
+        // t パラメータ（時刻）— /settime を省略するための統合パラメータ
+        char tParam[32] = {0};
+        if (httpd_query_key_value(query, "t", tParam, sizeof(tParam)) == ESP_OK
+            && strlen(tParam) == 14) {
+            currentTime = String(tParam);
+        }
     }
 
-    // /photo/ ディレクトリを自動作成
-    if (!SD_MMC.exists("/photo")) {
-        SD_MMC.mkdir("/photo");
-    }
+    // 年月フォルダを自動作成（/photo/YYYYMM/）
+    String monthDir = ensureMonthDir();
 
     camera_fb_t *fb = nullptr;
 
@@ -383,15 +445,15 @@ static esp_err_t captureHandler(httpd_req_t *req) {
         return ESP_OK;
     }
 
-    // ファイル名を決定する
+    // ファイル名を決定する（/photo/YYYYMM/YYYYMMDD_HHmmss.jpg）
     String filePath;
     if (currentTime.length() == 14) {
-        // 時刻設定済み: YYYYMMDDHHmmss → YYYYMMDD_HHmmss.jpg
+        // 時刻設定済み: /photo/YYYYMM/YYYYMMDD_HHmmss.jpg
         String dateStr = currentTime.substring(0, 8);
         String timeStr = currentTime.substring(8, 14);
-        filePath = "/photo/" + dateStr + "_" + timeStr + ".jpg";
+        filePath = monthDir + "/" + dateStr + "_" + timeStr + ".jpg";
     } else {
-        // 時刻未設定: 連番ファイル名
+        // 時刻未設定: /photo/unknown/photo_001.jpg
         filePath = generateSeqFileName();
     }
 
@@ -417,17 +479,17 @@ static esp_err_t captureHandler(httpd_req_t *req) {
 
     Serial.println("[CAPTURE] 保存: " + filePath);
 
-    // ファイル名のみ（パスなし）をレスポンスに含める
-    String fileName = filePath.substring(7); // "/photo/" を除去
+    // レスポンス: "/photo/" を除いた相対パスを返す（HTMLのfile引数に直接使える形式）
+    String relPath = filePath.substring(7); // "/photo/YYYYMM/file.jpg" → "YYYYMM/file.jpg"
     String flashStr = useFlash ? "on" : "off";
-    String resp = "{\"status\":\"ok\",\"file\":\"" + filePath + "\",\"flash\":\"" + flashStr + "\"}";
+    String resp = "{\"status\":\"ok\",\"file\":\"" + relPath + "\",\"flash\":\"" + flashStr + "\"}";
     httpd_resp_send(req, resp.c_str(), HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
 // ============================================================
 // 写真一覧取得ハンドラ（GET /photos）
-// /photo/ ディレクトリのJPEGファイル名を降順で返す
+// チャンク送信でヒープ使用量を抑える
 // ============================================================
 static esp_err_t photosHandler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -436,20 +498,38 @@ static esp_err_t photosHandler(httpd_req_t *req) {
 
     std::vector<String> files = listPhotoFiles();
 
-    // JSON配列を構築
-    String json = "{\"files\":[";
+    // チャンク送信: 巨大なStringを1つ作らず1エントリずつ送る
+    httpd_resp_send_chunk(req, "{\"files\":[", 10);
     for (size_t i = 0; i < files.size(); i++) {
-        if (i > 0) json += ",";
-        json += "\"" + files[i] + "\"";
+        String entry = (i > 0 ? "," : "");
+        entry += "\"" + files[i] + "\"";
+        httpd_resp_send_chunk(req, entry.c_str(), entry.length());
     }
-    json += "]}";
-
-    httpd_resp_send(req, json.c_str(), HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, "]}", 2);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
 // ============================================================
-// 写真取得ハンドラ（GET /photo?file=ファイル名.jpg）
+// URLデコード（%2F→/ など）
+// httpd_query_key_value はデコードしないため手動で処理する
+// ============================================================
+static String urlDecode(const char* src) {
+    String result;
+    while (*src) {
+        if (*src == '%' && isxdigit((unsigned char)src[1]) && isxdigit((unsigned char)src[2])) {
+            char hex[3] = { src[1], src[2], '\0' };
+            result += (char)strtol(hex, nullptr, 16);
+            src += 3;
+        } else {
+            result += *src++;
+        }
+    }
+    return result;
+}
+
+// ============================================================
+// 写真取得ハンドラ（GET /photo?file=YYYYMM/YYYYMMDD_HHmmss.jpg）
 // 指定ファイルをSDカードから読み込んでバイナリ送信する
 // ============================================================
 static esp_err_t photoHandler(httpd_req_t *req) {
@@ -469,9 +549,12 @@ static esp_err_t photoHandler(httpd_req_t *req) {
         return ESP_OK;
     }
 
-    // パスインジェクション対策: ファイル名に / や .. が含まれないようにする
-    String fileName = String(fileParam);
-    if (fileName.indexOf('/') >= 0 || fileName.indexOf("..") >= 0) {
+    // URLデコード（%2F→/ など）してからパス検証
+    String fileName = urlDecode(fileParam);
+
+    // パスインジェクション対策: .. を含むパスを拒否
+    // YYYYMM/YYYYMMDD_HHmmss.jpg 形式のサブフォルダパスは許可する
+    if (fileName.indexOf("..") >= 0) {
         httpd_resp_send_404(req);
         return ESP_OK;
     }
@@ -503,61 +586,112 @@ static esp_err_t photoHandler(httpd_req_t *req) {
 }
 
 // ============================================================
-// 全エンドポイントを1つのHTTPサーバー（ポート80）で起動する
-// メモリ節約のため2サーバー構成をやめて統合する
+// SDカード・システム状態確認ハンドラ（GET /status）
+// ============================================================
+static esp_err_t statusHandler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_type(req, "application/json");
+
+    uint8_t cardType = SD_MMC.cardType();
+    bool sdOk = (cardType != CARD_NONE);
+
+    const char* typeStr = (cardType == CARD_MMC)  ? "MMC"  :
+                          (cardType == CARD_SD)   ? "SD"   :
+                          (cardType == CARD_SDHC) ? "SDHC" :
+                          (cardType == CARD_NONE) ? "NONE" : "UNKNOWN";
+
+    uint64_t cardMB  = sdOk ? SD_MMC.cardSize() / (1024 * 1024) : 0;
+    uint64_t totalMB = sdOk ? SD_MMC.totalBytes() / (1024 * 1024) : 0;
+    uint64_t usedMB  = sdOk ? SD_MMC.usedBytes()  / (1024 * 1024) : 0;
+
+    char json[256];
+    snprintf(json, sizeof(json),
+        "{\"sd\":{\"mounted\":%s,\"type\":\"%s\",\"card_mb\":%llu,\"total_mb\":%llu,\"used_mb\":%llu},\"wifi\":\"%s\"}",
+        sdOk ? "true" : "false",
+        typeStr,
+        cardMB, totalMB, usedMB,
+        WiFi.localIP().toString().c_str()
+    );
+
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// ============================================================
+// サーバー起動
+// port 81: ストリーム専用（while(true)ループがタスクを占有するため分離）
+// port 80: その他全エンドポイント
 // ============================================================
 void startCamServer() {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port      = 80;
-    config.max_uri_handlers = 8;
-    config.max_open_sockets = 3; // メモリ節約
+    // --- ストリームサーバー (port 81) ---
+    httpd_config_t sCfg = HTTPD_DEFAULT_CONFIG();
+    sCfg.server_port      = 81;
+    sCfg.ctrl_port        = 32769; // port 80サーバーの制御ポートと競合回避
+    sCfg.max_uri_handlers = 1;
+    sCfg.max_open_sockets = 6;     // 6台同時ストリーム対応
 
-    if (httpd_start(&camHttpd, &config) != ESP_OK) {
+    if (httpd_start(&streamHttpd, &sCfg) == ESP_OK) {
+        httpd_uri_t streamUri = {
+            .uri      = "/stream",
+            .method   = HTTP_GET,
+            .handler  = streamHandler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(streamHttpd, &streamUri);
+    }
+
+    // --- APIサーバー (port 80) ---
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.server_port      = 80;
+    cfg.max_uri_handlers = 8;
+    cfg.max_open_sockets = 5;
+
+    if (httpd_start(&camHttpd, &cfg) != ESP_OK) {
         Serial.println("[ERROR] サーバー起動失敗");
         return;
     }
 
-    httpd_uri_t streamUri = {
-        .uri       = "/stream",
-        .method    = HTTP_GET,
-        .handler   = streamHandler,
-        .user_ctx  = NULL
-    };
-    httpd_register_uri_handler(camHttpd, &streamUri);
-
     httpd_uri_t captureUri = {
-        .uri       = "/capture",
-        .method    = HTTP_GET,
-        .handler   = captureHandler,
-        .user_ctx  = NULL
+        .uri      = "/capture",
+        .method   = HTTP_GET,
+        .handler  = captureHandler,
+        .user_ctx = NULL
     };
     httpd_register_uri_handler(camHttpd, &captureUri);
 
     httpd_uri_t setTimeUri = {
-        .uri       = "/settime",
-        .method    = HTTP_GET,
-        .handler   = setTimeHandler,
-        .user_ctx  = NULL
+        .uri      = "/settime",
+        .method   = HTTP_GET,
+        .handler  = setTimeHandler,
+        .user_ctx = NULL
     };
     httpd_register_uri_handler(camHttpd, &setTimeUri);
 
     httpd_uri_t photosUri = {
-        .uri       = "/photos",
-        .method    = HTTP_GET,
-        .handler   = photosHandler,
-        .user_ctx  = NULL
+        .uri      = "/photos",
+        .method   = HTTP_GET,
+        .handler  = photosHandler,
+        .user_ctx = NULL
     };
     httpd_register_uri_handler(camHttpd, &photosUri);
 
     httpd_uri_t photoUri = {
-        .uri       = "/photo",
-        .method    = HTTP_GET,
-        .handler   = photoHandler,
-        .user_ctx  = NULL
+        .uri      = "/photo",
+        .method   = HTTP_GET,
+        .handler  = photoHandler,
+        .user_ctx = NULL
     };
     httpd_register_uri_handler(camHttpd, &photoUri);
 
-    Serial.println("[OK] サーバー起動 (port 80)");
+    httpd_uri_t statusUri = {
+        .uri      = "/status",
+        .method   = HTTP_GET,
+        .handler  = statusHandler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(camHttpd, &statusUri);
+
+    Serial.println("[OK] サーバー起動 (port 80/81)");
 }
 
 // ============================================================
@@ -590,11 +724,12 @@ void setup() {
     Serial.println(" ESP32-CAM Stream Server");
     Serial.println("==========================");
     Serial.println("[OK] WiFi接続: " + ip);
-    Serial.println("[ENDPOINT] Stream  : http://" + ip + "/stream");
+    Serial.println("[ENDPOINT] Stream  : http://" + ip + ":81/stream");
     Serial.println("[ENDPOINT] Capture : http://" + ip + "/capture?flash=on(off)");
     Serial.println("[ENDPOINT] SetTime : http://" + ip + "/settime?t=YYYYMMDDHHmmss");
     Serial.println("[ENDPOINT] Photos  : http://" + ip + "/photos");
     Serial.println("[ENDPOINT] Photo   : http://" + ip + "/photo?file=ファイル名.jpg");
+    Serial.println("[ENDPOINT] Status  : http://" + ip + "/status");
     Serial.println("==========================");
 }
 

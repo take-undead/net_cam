@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32-CAM Viewer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: sans-serif;
+      background: #1a1a1a;
+      color: #e0e0e0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ヘッダー */
+    #header {
+      background: #2a2a2a;
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      border-bottom: 1px solid #3a3a3a;
+      flex-shrink: 0;
+    }
+    #header h1 { font-size: 1rem; font-weight: bold; }
+
+    /* メインレイアウト */
+    #main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* カメラグリッド（3列×2行） */
+    #cam-grid {
+      flex: 1;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      grid-template-rows: repeat(2, 1fr);
+      gap: 6px;
+      padding: 6px;
+      overflow: hidden;
+      min-width: 0;
+    }
+
+    /* カメラタイル */
+    .cam-tile {
+      background: #222;
+      border: 2px solid #3a3a3a;
+      border-radius: 6px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    .cam-tile.selected { border-color: #2196f3; }
+
+    /* タイルヘッダー */
+    .tile-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      background: #2a2a2a;
+      flex-shrink: 0;
+    }
+    .tile-label {
+      font-size: 0.75rem;
+      font-weight: bold;
+      color: #aaa;
+      flex-shrink: 0;
+    }
+    .tile-ip {
+      background: #333;
+      border: 1px solid #444;
+      color: #e0e0e0;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 0.72rem;
+      flex: 1;
+      min-width: 0;
+    }
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #555;
+      flex-shrink: 0;
+    }
+    .status-dot.online  { background: #4caf50; }
+    .status-dot.offline { background: #f44336; }
+
+    /* ストリーム表示エリア */
+    .stream-wrap {
+      flex: 1;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      min-height: 0;
+    }
+    .stream-img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: none;
+    }
+    .stream-placeholder {
+      color: #444;
+      font-size: 0.75rem;
+    }
+
+    /* タイル操作バー */
+    .tile-controls {
+      display: flex;
+      gap: 4px;
+      padding: 4px 6px;
+      background: #252525;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    button {
+      padding: 4px 10px;
+      border: none;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 0.72rem;
+      font-weight: bold;
+      transition: opacity 0.15s;
+      white-space: nowrap;
+    }
+    button:hover    { opacity: 0.82; }
+    button:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    .btn-stream  { background: #2196f3; color: #fff; }
+    .btn-stop    { background: #607d8b; color: #fff; }
+    .btn-capture { background: #4caf50; color: #fff; }
+    .btn-flash   { background: #ff9800; color: #fff; min-width: 80px; }
+    .btn-photos  { background: #9c27b0; color: #fff; margin-left: auto; }
+
+    .tile-msg {
+      font-size: 0.68rem;
+      color: #888;
+      align-self: center;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 120px;
+    }
+
+    /* 右ペイン: 写真ブラウザ */
+    #photo-pane {
+      width: 240px;
+      flex-shrink: 0;
+      background: #222;
+      border-left: 1px solid #3a3a3a;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #photo-pane-header {
+      padding: 8px 10px;
+      border-bottom: 1px solid #3a3a3a;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    #photo-pane-header h2 { font-size: 0.82rem; flex: 1; }
+
+    #btn-reload-photos {
+      background: #444;
+      color: #ccc;
+      padding: 3px 8px;
+      font-size: 0.72rem;
+    }
+
+    #photo-cam-label {
+      font-size: 0.72rem;
+      color: #888;
+      padding: 4px 10px;
+      border-bottom: 1px solid #2a2a2a;
+      flex-shrink: 0;
+    }
+
+    #photo-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 4px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .photo-item {
+      background: #2a2a2a;
+      border: 1px solid #3a3a3a;
+      border-radius: 3px;
+      padding: 5px 7px;
+      cursor: pointer;
+      font-size: 0.7rem;
+      line-height: 1.4;
+      transition: background 0.1s;
+      word-break: break-all;
+    }
+    .photo-item:hover  { background: #333; }
+    .photo-item.active { border-color: #2196f3; background: #1a2a3a; }
+
+    #photo-empty {
+      color: #555;
+      font-size: 0.75rem;
+      text-align: center;
+      margin-top: 20px;
+    }
+
+    /* モーダル */
+    #modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.88);
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+    }
+    #modal.show { display: flex; }
+
+    #modal-img {
+      max-width: 90vw;
+      max-height: 90vh;
+      border-radius: 4px;
+      cursor: zoom-out;
+    }
+    #modal-close {
+      position: absolute;
+      top: 16px; right: 20px;
+      font-size: 1.8rem;
+      cursor: pointer;
+      color: #fff;
+      line-height: 1;
+    }
+    #modal-info {
+      position: absolute;
+      bottom: 16px;
+      font-size: 0.78rem;
+      color: #aaa;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+<div id="header">
+  <h1>ESP32-CAM Viewer</h1>
+</div>
+
+<div id="main">
+  <div id="cam-grid"></div>
+
+  <div id="photo-pane">
+    <div id="photo-pane-header">
+      <h2>保存済み写真</h2>
+      <button id="btn-reload-photos">↺</button>
+    </div>
+    <div id="photo-cam-label">カメラを選択してください</div>
+    <div id="photo-list">
+      <div id="photo-empty"></div>
+    </div>
+  </div>
+</div>
+
+<div id="modal">
+  <span id="modal-close">✕</span>
+  <img id="modal-img" alt="photo">
+  <div id="modal-info"></div>
+</div>
+
+<script>
+// ============================================================
+// カメラ設定（IPはlocalStorageに保存・復元）
+// ============================================================
+const CAM_COUNT = 6;
+
+function loadIPs() {
+  const saved = JSON.parse(localStorage.getItem('cam_ips') || '[]');
+  return Array.from({ length: CAM_COUNT }, (_, i) => ({
+    id: i,
+    label: `CAM ${i + 1}`,
+    ip: saved[i] || `192.168.1.${141 + i}`,
+    streaming: false,
+    flashOn: false,
+    busy: false,   // 排他制御フラグ（撮影・写真取得中はtrue）
+  }));
+}
+
+function saveIPs() {
+  localStorage.setItem('cam_ips', JSON.stringify(cameras.map(c => c.ip)));
+}
+
+const cameras = loadIPs();
+
+// 現在写真ブラウザで表示しているカメラのID
+let selectedCamId = null;
+
+// ============================================================
+// カメラタイルを生成
+// ============================================================
+function buildGrid() {
+  const grid = document.getElementById('cam-grid');
+  cameras.forEach(cam => {
+    const tile = document.createElement('div');
+    tile.className = 'cam-tile';
+    tile.dataset.id = cam.id;
+    tile.innerHTML = `
+      <div class="tile-header">
+        <span class="tile-label">${cam.label}</span>
+        <input class="tile-ip" type="text" value="${cam.ip}" placeholder="IPアドレス">
+        <span class="status-dot" id="dot-${cam.id}"></span>
+      </div>
+      <div class="stream-wrap" id="wrap-${cam.id}">
+        <span class="stream-placeholder">停止中</span>
+        <img class="stream-img" id="img-${cam.id}" alt="${cam.label}">
+      </div>
+      <div class="tile-controls">
+        <button class="btn-stream"  id="btn-play-${cam.id}">▶</button>
+        <button class="btn-stop"    id="btn-stop-${cam.id}" disabled>■</button>
+        <button class="btn-capture" id="btn-cap-${cam.id}">📷</button>
+        <button class="btn-flash"   id="btn-flash-${cam.id}">💡OFF</button>
+        <button class="btn-photos"  id="btn-photo-${cam.id}">写真</button>
+        <span   class="tile-msg"    id="msg-${cam.id}"></span>
+      </div>
+    `;
+    grid.appendChild(tile);
+
+    // IP変更時に保存
+    tile.querySelector('.tile-ip').addEventListener('change', e => {
+      cameras[cam.id].ip = e.target.value.trim();
+      saveIPs();
+    });
+
+    // ストリーム開始
+    document.getElementById(`btn-play-${cam.id}`).addEventListener('click', e => {
+      e.stopPropagation();
+      startStream(cam.id);
+    });
+
+    // ストリーム停止
+    document.getElementById(`btn-stop-${cam.id}`).addEventListener('click', e => {
+      e.stopPropagation();
+      stopStream(cam.id);
+    });
+
+    // 撮影
+    document.getElementById(`btn-cap-${cam.id}`).addEventListener('click', e => {
+      e.stopPropagation();
+      capture(cam.id);
+    });
+
+    // フラッシュ切り替え
+    document.getElementById(`btn-flash-${cam.id}`).addEventListener('click', e => {
+      e.stopPropagation();
+      cameras[cam.id].flashOn = !cameras[cam.id].flashOn;
+      e.target.textContent = cameras[cam.id].flashOn ? '💡ON' : '💡OFF';
+    });
+
+    // 写真一覧表示
+    document.getElementById(`btn-photo-${cam.id}`).addEventListener('click', e => {
+      e.stopPropagation();
+      selectCamera(cam.id);
+    });
+
+    // タイルクリックで選択
+    tile.addEventListener('click', () => selectCamera(cam.id));
+
+    // ストリームエラー時に停止
+    document.getElementById(`img-${cam.id}`).addEventListener('error', () => {
+      if (cameras[cam.id].streaming) stopStream(cam.id);
+    });
+  });
+}
+
+// ============================================================
+// ストリーム制御
+// ============================================================
+function startStream(id) {
+  const cam = cameras[id];
+  const img  = document.getElementById(`img-${id}`);
+  const wrap = document.getElementById(`wrap-${id}`);
+  img.src = `http://${cam.ip}:81/stream`;
+  img.style.display = 'block';
+  wrap.querySelector('.stream-placeholder').style.display = 'none';
+  document.getElementById(`btn-play-${id}`).disabled = true;
+  document.getElementById(`btn-stop-${id}`).disabled = false;
+  cam.streaming = true;
+}
+
+function stopStream(id) {
+  const cam = cameras[id];
+  const img  = document.getElementById(`img-${id}`);
+  const wrap = document.getElementById(`wrap-${id}`);
+  img.src = '';
+  img.style.display = 'none';
+  wrap.querySelector('.stream-placeholder').style.display = 'block';
+  document.getElementById(`btn-play-${id}`).disabled = false;
+  document.getElementById(`btn-stop-${id}`).disabled = true;
+  cam.streaming = false;
+}
+
+// ============================================================
+// 撮影（時刻を t パラメータに統合して1リクエストで完結）
+// ============================================================
+async function capture(id) {
+  const cam = cameras[id];
+  if (cam.busy) return;
+  cam.busy = true;
+
+  const btn = document.getElementById(`btn-cap-${id}`);
+  btn.disabled = true;
+  setMsg(id, '撮影中...');
+
+  const now = new Date();
+  const t = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+    String(now.getHours()).padStart(2, '0'),
+    String(now.getMinutes()).padStart(2, '0'),
+    String(now.getSeconds()).padStart(2, '0'),
+  ].join('');
+
+  try {
+    const flash = cam.flashOn ? 'on' : 'off';
+    const res  = await fetch(
+      `http://${cam.ip}/capture?flash=${flash}&t=${t}`,
+      { signal: AbortSignal.timeout(10000) }
+    );
+    const json = await res.json();
+    if (json.status === 'ok') {
+      setMsg(id, json.file);
+      if (selectedCamId === id) loadPhotoList(id);
+    } else {
+      setMsg(id, '失敗: ' + (json.message || ''), true);
+    }
+  } catch {
+    setMsg(id, '通信エラー', true);
+  } finally {
+    btn.disabled = false;
+    cam.busy = false;
+  }
+}
+
+function setMsg(id, text, isError = false) {
+  const el = document.getElementById(`msg-${id}`);
+  el.textContent = text;
+  el.style.color = isError ? '#f44336' : '#888';
+}
+
+// ============================================================
+// カメラ選択（写真ブラウザに反映）
+// ============================================================
+function selectCamera(id) {
+  selectedCamId = id;
+
+  // タイル枠色
+  document.querySelectorAll('.cam-tile').forEach(t =>
+    t.classList.toggle('selected', parseInt(t.dataset.id) === id)
+  );
+
+  document.getElementById('photo-cam-label').textContent = cameras[id].label + '  ' + cameras[id].ip;
+  loadPhotoList(id);
+}
+
+// ============================================================
+// 写真一覧（排他制御: busy中は実行しない）
+// ============================================================
+async function loadPhotoList(id) {
+  if (id === undefined) id = selectedCamId;
+  if (id === null) return;
+
+  const cam = cameras[id];
+  if (cam.busy) return;
+  cam.busy = true;
+
+  const listEl = document.getElementById('photo-list');
+  listEl.innerHTML = '<div id="photo-empty">読み込み中...</div>';
+
+  try {
+    const res  = await fetch(`http://${cam.ip}/photos`, { signal: AbortSignal.timeout(5000) });
+    const json = await res.json();
+    const files = json.files || [];
+
+    listEl.innerHTML = '';
+    if (files.length === 0) {
+      listEl.innerHTML = '<div id="photo-empty">写真がありません</div>';
+      return;
+    }
+
+    files.forEach(file => {
+      const item = document.createElement('div');
+      item.className = 'photo-item';
+      item.textContent = formatFileName(file);
+      item.title = file;
+      item.addEventListener('click', () => openPhoto(id, file, item));
+      listEl.appendChild(item);
+    });
+  } catch {
+    listEl.innerHTML = '<div id="photo-empty">読み込み失敗</div>';
+  } finally {
+    cam.busy = false;
+  }
+}
+
+function formatFileName(file) {
+  const m = file.match(/(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.jpg/i);
+  if (m) return `${m[1]}/${m[2]}/${m[3]}  ${m[4]}:${m[5]}:${m[6]}`;
+  return file;
+}
+
+// ============================================================
+// 写真拡大モーダル
+// ============================================================
+function openPhoto(camId, file, itemEl) {
+  document.querySelectorAll('.photo-item').forEach(el => el.classList.remove('active'));
+  itemEl.classList.add('active');
+
+  document.getElementById('modal-img').src =
+    `http://${cameras[camId].ip}/photo?file=${encodeURIComponent(file)}`;
+  document.getElementById('modal-info').textContent =
+    cameras[camId].label + '  ' + file;
+  document.getElementById('modal').classList.add('show');
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.remove('show');
+  document.getElementById('modal-img').src = '';
+}
+
+document.getElementById('modal-close').addEventListener('click', closeModal);
+document.getElementById('modal-img').addEventListener('click', closeModal);
+document.getElementById('modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('modal')) closeModal();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// ============================================================
+// 写真一覧更新ボタン
+// ============================================================
+document.getElementById('btn-reload-photos').addEventListener('click', () => {
+  loadPhotoList();
+});
+
+// ============================================================
+// 接続状態ポーリング（全カメラ、5秒ごと）
+// ストリーミング中・busy中はソケットを消費しないためスキップ
+// ============================================================
+async function pollStatus() {
+  await Promise.allSettled(cameras.map(async cam => {
+    const dot = document.getElementById(`dot-${cam.id}`);
+    // ストリーム中はオンライン確定のためポーリング不要
+    if (cam.streaming) { dot.className = 'status-dot online'; return; }
+    // busy中（撮影・写真取得）はスキップしてソケットを空けておく
+    if (cam.busy) return;
+    try {
+      const res = await fetch(`http://${cam.ip}/status`, { signal: AbortSignal.timeout(3000) });
+      dot.className = 'status-dot ' + (res.ok ? 'online' : 'offline');
+    } catch {
+      dot.className = 'status-dot offline';
+    }
+  }));
+}
+
+// ============================================================
+// 初期化
+// ============================================================
+buildGrid();
+pollStatus();
+setInterval(pollStatus, 5000);
+</script>
+</body>
+</html>
