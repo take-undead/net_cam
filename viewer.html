@@ -298,6 +298,7 @@ function loadIPs() {
     streaming: false,
     flashOn: false,
     busy: false,   // 排他制御フラグ（撮影・写真取得中はtrue）
+    online: false, // 前回のポーリング結果（false→trueで自動再生）
   }));
 }
 
@@ -576,11 +577,20 @@ async function pollStatus() {
     if (cam.streaming) { dot.className = 'status-dot online'; return; }
     // busy中（撮影・写真取得）はスキップしてソケットを空けておく
     if (cam.busy) return;
+
+    const wasOnline = cam.online;
     try {
       const res = await fetch(`http://${cam.ip}/status`, { signal: AbortSignal.timeout(3000) });
-      dot.className = 'status-dot ' + (res.ok ? 'online' : 'offline');
+      cam.online = res.ok;
     } catch {
-      dot.className = 'status-dot offline';
+      cam.online = false;
+    }
+
+    dot.className = 'status-dot ' + (cam.online ? 'online' : 'offline');
+
+    // オフライン→オンラインに変わったら自動ストリーム開始
+    if (!wasOnline && cam.online) {
+      startStream(cam.id);
     }
   }));
 }

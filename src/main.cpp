@@ -30,6 +30,8 @@
 #include <FS.h>
 #include <vector>
 #include <algorithm>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 // ============================================================
 // カメラピン定義（AI-Thinker ESP32-CAM 固定値）
@@ -79,12 +81,122 @@ String cfgDns      = DEF_DNS;
 String cfgSSID     = DEF_SSID;
 String cfgPassword = DEF_PASSWORD;
 
-// HTTPサーバーハンドル
-// ストリームは専用サーバー(port 81)に分離する
-// 理由: httpd はシングルタスクのためストリームの while(true) が
-//       同一サーバーの他リクエスト処理をブロックするため
-httpd_handle_t streamHttpd = NULL;
-httpd_handle_t camHttpd    = NULL;
+// HTTPサーバーハンドル（port 80: API専用）
+httpd_handle_t camHttpd = NULL;
+
+// ============================================================
+// ストリームブロードキャスト（port 81, rawソケット）
+// 1タスクがフレームを取得して全クライアントに一斉送信する
+// fb_count に依存しないため接続数の制限がなくなる
+// ============================================================
+#define STREAM_PORT        81
+#define MAX_STREAM_CLIENTS 8
+
+static int               streamFds[MAX_STREAM_CLIENTS];
+static SemaphoreHandle_t streamMutex = NULL;
+
+static const char STREAM_HTTP_HDR[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Access-Control-Allow-Origin: *\r\n"
+    "Content-Type: multipart/x-mixed-replace;boundary=MJPEG\r\n"
+    "Cache-Control: no-cache\r\n"
+    "\r\n";
+static const char MJPEG_PART_HDR[] = "--MJPEG\r\nContent-Type: image/jpeg\r\n\r\n";
+static const char MJPEG_PART_END[] = "\r\n";
+
+// 接続受付タスク
+static void streamAcceptTask(void*) {
+    int serverFd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr = {};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(STREAM_PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    bind(serverFd, (struct sockaddr*)&addr, sizeof(addr));
+    listen(serverFd, MAX_STREAM_CLIENTS);
+
+    while (true) {
+        int clientFd = accept(serverFd, NULL, NULL);
+        if (clientFd < 0) continue;
+
+        // 送信タイムアウト設定（遅いクライアントで他をブロックしない）
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        // HTTPリクエストを読み捨て
+        char buf[256];
+        recv(clientFd, buf, sizeof(buf) - 1, 0);
+
+        // HTTPレスポンスヘッダー送信
+        send(clientFd, STREAM_HTTP_HDR, strlen(STREAM_HTTP_HDR), 0);
+
+        // クライアント登録
+        bool registered = false;
+        xSemaphoreTake(streamMutex, portMAX_DELAY);
+        for (int i = 0; i < MAX_STREAM_CLIENTS; i++) {
+            if (streamFds[i] < 0) {
+                streamFds[i] = clientFd;
+                registered = true;
+                Serial.printf("[STREAM] 接続 slot=%d\n", i);
+                break;
+            }
+        }
+        xSemaphoreGive(streamMutex);
+
+        if (!registered) {
+            close(clientFd);
+            Serial.println("[STREAM] 上限(" + String(MAX_STREAM_CLIENTS) + "台)に達しました");
+        }
+    }
+}
+
+// ブロードキャストタスク
+static void streamBroadcastTask(void*) {
+    while (true) {
+        // クライアントがいない間はカメラを使わない
+        bool hasClients = false;
+        xSemaphoreTake(streamMutex, portMAX_DELAY);
+        for (int i = 0; i < MAX_STREAM_CLIENTS; i++) {
+            if (streamFds[i] >= 0) { hasClients = true; break; }
+        }
+        xSemaphoreGive(streamMutex);
+
+        if (!hasClients) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+
+        xSemaphoreTake(streamMutex, portMAX_DELAY);
+        for (int i = 0; i < MAX_STREAM_CLIENTS; i++) {
+            if (streamFds[i] < 0) continue;
+            int fd = streamFds[i];
+            bool ok = send(fd, MJPEG_PART_HDR, strlen(MJPEG_PART_HDR), 0) > 0;
+            ok = ok && send(fd, (char*)fb->buf, fb->len, 0) > 0;
+            ok = ok && send(fd, MJPEG_PART_END, strlen(MJPEG_PART_END), 0) > 0;
+            if (!ok) {
+                close(fd);
+                streamFds[i] = -1;
+                Serial.printf("[STREAM] 切断 slot=%d\n", i);
+            }
+        }
+        xSemaphoreGive(streamMutex);
+
+        esp_camera_fb_return(fb);
+    }
+}
+
+void startStreamServer() {
+    streamMutex = xSemaphoreCreateMutex();
+    for (int i = 0; i < MAX_STREAM_CLIENTS; i++) streamFds[i] = -1;
+    xTaskCreate(streamAcceptTask,    "stream_accept", 4096, NULL, 5, NULL);
+    xTaskCreate(streamBroadcastTask, "stream_bcast",  4096, NULL, 5, NULL);
+    Serial.println("[OK] ストリームサーバー起動 (port 81, broadcast)");
+}
 
 // ============================================================
 // 文字列ユーティリティ：前後の空白を除去する
@@ -323,50 +435,7 @@ static String generateSeqFileName() {
     return dir + "/photo_unknown.jpg";
 }
 
-// ============================================================
-// MJPEGストリームハンドラ（GET /stream）
-// フレームを連続送信し続ける。エラー時はループを抜ける
-// ============================================================
-static esp_err_t streamHandler(httpd_req_t *req) {
-    // CORSヘッダー付与
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET");
 
-    // MJPEGコンテンツタイプ設定
-    httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=BOUNDARY");
-
-    static const char* boundary = "--BOUNDARY\r\nContent-Type: image/jpeg\r\n\r\n";
-    static const char* boundaryEnd = "\r\n";
-
-    while (true) {
-        // フレームバッファ取得
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) {
-            Serial.println("[WARN] フレームバッファ取得失敗");
-            break;
-        }
-
-        // バウンダリヘッダー送信
-        esp_err_t res = httpd_resp_send_chunk(req, boundary, strlen(boundary));
-        if (res != ESP_OK) {
-            esp_camera_fb_return(fb);
-            break;
-        }
-
-        // JPEGデータ送信
-        res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
-        esp_camera_fb_return(fb); // 必ずメモリ解放
-        if (res != ESP_OK) break;
-
-        // バウンダリ末尾送信
-        res = httpd_resp_send_chunk(req, boundaryEnd, strlen(boundaryEnd));
-        if (res != ESP_OK) break;
-    }
-
-    // チャンク送信終了
-    httpd_resp_send_chunk(req, NULL, 0);
-    return ESP_OK;
-}
 
 // ============================================================
 // 時刻設定ハンドラ（GET /settime?t=YYYYMMDDHHmmss）
@@ -635,28 +704,10 @@ static esp_err_t statusHandler(httpd_req_t *req) {
 }
 
 // ============================================================
-// サーバー起動
-// port 81: ストリーム専用（while(true)ループがタスクを占有するため分離）
-// port 80: その他全エンドポイント
+// APIサーバー起動（port 80）
+// ストリームは startStreamServer()（port 81, rawソケット）で別途起動
 // ============================================================
 void startCamServer() {
-    // --- ストリームサーバー (port 81) ---
-    httpd_config_t sCfg = HTTPD_DEFAULT_CONFIG();
-    sCfg.server_port      = 81;
-    sCfg.ctrl_port        = 32769; // port 80サーバーの制御ポートと競合回避
-    sCfg.max_uri_handlers = 1;
-    sCfg.max_open_sockets = 6;     // 6台同時ストリーム対応
-
-    if (httpd_start(&streamHttpd, &sCfg) == ESP_OK) {
-        httpd_uri_t streamUri = {
-            .uri      = "/stream",
-            .method   = HTTP_GET,
-            .handler  = streamHandler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(streamHttpd, &streamUri);
-    }
-
     // --- APIサーバー (port 80) ---
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
@@ -708,7 +759,7 @@ void startCamServer() {
     };
     httpd_register_uri_handler(camHttpd, &statusUri);
 
-    Serial.println("[OK] サーバー起動 (port 80/81)");
+    Serial.println("[OK] APIサーバー起動 (port 80)");
 }
 
 // ============================================================
@@ -732,10 +783,13 @@ void setup() {
     // 5. カメラ初期化
     initCamera();
 
-    // 6. HTTPサーバー起動（ポート80に全エンドポイント統合）
+    // 6. APIサーバー起動（port 80）
     startCamServer();
 
-    // 7. 起動完了・エンドポイント一覧をシリアル出力
+    // 7. ストリームサーバー起動（port 81, rawソケット broadcast）
+    startStreamServer();
+
+    // 8. 起動完了・エンドポイント一覧をシリアル出力
     String ip = WiFi.localIP().toString();
     Serial.println("==========================");
     Serial.println(" ESP32-CAM Stream Server");
