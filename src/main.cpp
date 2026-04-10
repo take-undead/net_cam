@@ -19,14 +19,15 @@
  * ■ フラッシュLED（GPIO4）注意事項
  *   撮影フラッシュ専用。電流制限抵抗なし。
  *   連続点灯1秒以内厳守。過熱・焼損リスクあり。
- *   SDカードは1-bitモード初期化によりGPIO4競合なし。
+ *   SDカードはSPIモード（GPIO13/14/15/2）のためGPIO4競合なし。
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_camera.h>
 #include <esp_http_server.h>
-#include <SD_MMC.h>
+#include <SPI.h>
+#include <SD.h>
 #include <FS.h>
 #include <vector>
 #include <algorithm>
@@ -55,6 +56,14 @@
 
 // フラッシュLED ピン
 #define FLASH_GPIO_NUM   4
+
+// SDカード SPI ピン（AI-Thinker ESP32-CAM）
+#define SD_CS    13
+#define SD_MOSI  15
+#define SD_CLK   14
+#define SD_MISO   2
+
+static SPIClass sdSPI(HSPI);
 
 // ============================================================
 // ★ config.txtが無い場合のフォールバック値
@@ -214,38 +223,21 @@ static String trimString(const String &s) {
 // 失敗した場合はデフォルト値のまま続行する
 // ============================================================
 void loadConfig() {
-    // AI-Thinker ESP32-CAM: GPIO2（SD D0ライン）をプルアップしてから初期化
-    // フローティング状態のままだと0x107(ESP_ERR_TIMEOUT)で初期化失敗する
-    pinMode(2, INPUT_PULLUP);
-    delay(500);
-
-    // リトライ付きマウント（SD_MMC.end()でリセットしてから再試行）
-    bool mounted = false;
-    for (int attempt = 0; attempt < 3 && !mounted; attempt++) {
-        if (attempt > 0) {
-            SD_MMC.end();
-            delay(500);
-            Serial.printf("[INFO] SDカード再試行 %d/3\n", attempt + 1);
-        }
-        // 第2引数: true=1-bitモード(GPIO2のみ), false=4-bitモード(GPIO4がSDに使われフラッシュLED不可)
-        // 第4引数: SDMMC_FREQ_PROBING(400kHz) — デフォルト20MHzより低速で信号品質問題を回避
-        mounted = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_PROBING);
-    }
-
-    if (!mounted) {
+    sdSPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
+    if (!SD.begin(SD_CS, sdSPI, 4000000)) {
         Serial.println("[WARN] SDカードマウント失敗 → デフォルト値で起動");
         return;
     }
 
     // SDカード情報をシリアル出力
-    uint8_t cardType = SD_MMC.cardType();
+    uint8_t cardType = SD.cardType();
     const char* typeStr = (cardType == CARD_MMC)  ? "MMC"  :
                           (cardType == CARD_SD)   ? "SD"   :
                           (cardType == CARD_SDHC) ? "SDHC" : "UNKNOWN";
-    uint64_t cardMB = SD_MMC.cardSize() / (1024 * 1024);
+    uint64_t cardMB = SD.cardSize() / (1024 * 1024);
     Serial.printf("[SD] マウント成功 タイプ:%s 容量:%lluMB\n", typeStr, cardMB);
 
-    File f = SD_MMC.open("/config.txt", FILE_READ);
+    File f = SD.open("/config.txt", FILE_READ);
     if (!f) {
         Serial.println("[WARN] config.txt読み込み失敗 → デフォルト値で起動");
         return;
@@ -367,7 +359,7 @@ void initCamera() {
 static std::vector<String> listPhotoFiles() {
     std::vector<String> files;
 
-    File root = SD_MMC.open("/photo");
+    File root = SD.open("/photo");
     if (!root || !root.isDirectory()) return files;
 
     // 年月フォルダを走査
@@ -415,8 +407,8 @@ static String ensureMonthDir() {
     } else {
         dir = "/photo/unknown";
     }
-    if (!SD_MMC.exists("/photo")) SD_MMC.mkdir("/photo");
-    if (!SD_MMC.exists(dir))     SD_MMC.mkdir(dir);
+    if (!SD.exists("/photo")) SD.mkdir("/photo");
+    if (!SD.exists(dir))     SD.mkdir(dir);
     return dir;
 }
 
@@ -428,7 +420,7 @@ static String generateSeqFileName() {
     for (int i = 1; i <= 9999; i++) {
         char buf[48];
         snprintf(buf, sizeof(buf), "%s/photo_%03d.jpg", dir.c_str(), i);
-        if (!SD_MMC.exists(buf)) {
+        if (!SD.exists(buf)) {
             return String(buf);
         }
     }
@@ -544,7 +536,7 @@ static esp_err_t captureHandler(httpd_req_t *req) {
     }
 
     // SDカードに保存
-    File photoFile = SD_MMC.open(filePath, FILE_WRITE);
+    File photoFile = SD.open(filePath, FILE_WRITE);
     if (!photoFile) {
         esp_camera_fb_return(fb);
         digitalWrite(FLASH_GPIO_NUM, LOW); // 念のため消灯
@@ -647,7 +639,7 @@ static esp_err_t photoHandler(httpd_req_t *req) {
 
     String filePath = "/photo/" + fileName;
 
-    File f = SD_MMC.open(filePath, FILE_READ);
+    File f = SD.open(filePath, FILE_READ);
     if (!f) {
         httpd_resp_send_404(req);
         return ESP_OK;
@@ -678,7 +670,7 @@ static esp_err_t statusHandler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_type(req, "application/json");
 
-    uint8_t cardType = SD_MMC.cardType();
+    uint8_t cardType = SD.cardType();
     bool sdOk = (cardType != CARD_NONE);
 
     const char* typeStr = (cardType == CARD_MMC)  ? "MMC"  :
@@ -686,9 +678,9 @@ static esp_err_t statusHandler(httpd_req_t *req) {
                           (cardType == CARD_SDHC) ? "SDHC" :
                           (cardType == CARD_NONE) ? "NONE" : "UNKNOWN";
 
-    uint64_t cardMB  = sdOk ? SD_MMC.cardSize() / (1024 * 1024) : 0;
-    uint64_t totalMB = sdOk ? SD_MMC.totalBytes() / (1024 * 1024) : 0;
-    uint64_t usedMB  = sdOk ? SD_MMC.usedBytes()  / (1024 * 1024) : 0;
+    uint64_t cardMB  = sdOk ? SD.cardSize() / (1024 * 1024) : 0;
+    uint64_t totalMB = sdOk ? SD.totalBytes() / (1024 * 1024) : 0;
+    uint64_t usedMB  = sdOk ? SD.usedBytes()  / (1024 * 1024) : 0;
 
     char json[256];
     snprintf(json, sizeof(json),
